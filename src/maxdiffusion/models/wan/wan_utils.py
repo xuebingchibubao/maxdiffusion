@@ -88,6 +88,21 @@ def rename_for_custom_trasformer(key):
   return renamed_pt_key
 
 
+def _normalize_causal_forcing_key(pt_key: str) -> str:
+  for prefix in (
+      "model._fsdp_wrapped_module.",
+      "_fsdp_wrapped_module.",
+      "module.",
+  ):
+    if pt_key.startswith(prefix):
+      pt_key = pt_key[len(prefix) :]
+
+  if pt_key.startswith("model.") and not pt_key.startswith("model.diffusion_model."):
+    pt_key = pt_key[len("model.") :]
+
+  return pt_key
+
+
 def get_key_and_value(pt_tuple_key, tensor, flax_state_dict, random_flax_state_dict, scan_layers, num_layers=40):
   block_index = None
   if scan_layers:
@@ -265,6 +280,55 @@ def load_causvid_transformer(
       return flax_state_dict
 
 
+def _select_causal_forcing_state_dict(loaded_checkpoint: dict, use_ema: bool = False):
+  if not isinstance(loaded_checkpoint, dict):
+    return loaded_checkpoint
+  preferred_keys = ("generator_ema", "generator") if use_ema else ("generator", "generator_ema")
+  for key in preferred_keys + ("state_dict", "model"):
+    if key in loaded_checkpoint and isinstance(loaded_checkpoint[key], dict):
+      return loaded_checkpoint[key]
+  return loaded_checkpoint
+
+
+def load_causal_forcing_transformer(
+    checkpoint_path: str,
+    eval_shapes: dict,
+    device: str,
+    hf_download: bool = False,
+    num_layers: int = 40,
+    scan_layers: bool = True,
+):
+  del hf_download
+  device = jax.local_devices(backend=device)[0]
+  with jax.default_device(device):
+    loaded_checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    loaded_state_dict = _select_causal_forcing_state_dict(loaded_checkpoint)
+
+    flax_state_dict = {}
+    cpu = jax.local_devices(backend="cpu")[0]
+    random_flax_state_dict = _build_random_flax_state_dict(eval_shapes)
+    for pt_key, tensor in loaded_state_dict.items():
+      if not hasattr(tensor, "shape"):
+        continue
+      tensor = torch2jax(tensor)
+      pt_key = _normalize_causal_forcing_key(pt_key)
+      renamed_pt_key = rename_key(pt_key)
+      renamed_pt_key = rename_for_custom_trasformer(renamed_pt_key)
+      if renamed_pt_key.startswith("blocks."):
+        renamed_pt_key = renamed_pt_key.replace(".scale_shift_table", ".adaln_scale_shift_table")
+
+      pt_tuple_key = tuple(renamed_pt_key.split("."))
+      flax_key, flax_tensor = get_key_and_value(
+          pt_tuple_key, tensor, flax_state_dict, random_flax_state_dict, scan_layers, num_layers
+      )
+      flax_state_dict[flax_key] = jax.device_put(jnp.asarray(flax_tensor), device=cpu)
+
+    validate_flax_state_dict(eval_shapes, flax_state_dict)
+    flax_state_dict = unflatten_dict(flax_state_dict)
+    jax.clear_caches()
+    return flax_state_dict
+
+
 def load_wan_transformer(
     pretrained_model_name_or_path: str,
     eval_shapes: dict,
@@ -278,6 +342,10 @@ def load_wan_transformer(
     return load_causvid_transformer(pretrained_model_name_or_path, eval_shapes, device, hf_download, num_layers, scan_layers)
   elif pretrained_model_name_or_path == WAN_21_FUSION_X_MODEL_NAME_OR_PATH:
     return load_fusionx_transformer(pretrained_model_name_or_path, eval_shapes, device, hf_download, num_layers, scan_layers)
+  elif os.path.isfile(pretrained_model_name_or_path) and pretrained_model_name_or_path.endswith(".pt"):
+    return load_causal_forcing_transformer(
+        pretrained_model_name_or_path, eval_shapes, device, hf_download, num_layers, scan_layers
+    )
   else:
     return load_base_wan_transformer(
         pretrained_model_name_or_path, eval_shapes, device, hf_download, num_layers, scan_layers, subfolder

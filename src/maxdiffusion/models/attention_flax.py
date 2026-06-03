@@ -21,6 +21,7 @@ from flax import nnx
 import jax
 from jax.ad_checkpoint import checkpoint_name
 import jax.numpy as jnp
+import numpy as np
 from jax.experimental import shard_map
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
@@ -230,6 +231,61 @@ def _flash_sequence_length(tensor: Array) -> int:
   raise ValueError(f"Flash attention expects rank-3 or rank-4 inputs, got rank {tensor.ndim}.")
 
 
+def _is_semantic_attention_mask(attention_mask) -> bool:
+  """Returns True for QxKV attention masks, not batch padding masks."""
+  if attention_mask is None:
+    return False
+  if isinstance(attention_mask, jax.Array):
+    return False
+  if isinstance(attention_mask, np.ndarray):
+    return attention_mask.dtype == np.bool_ and attention_mask.ndim == 2
+  return hasattr(attention_mask, "shape") and len(attention_mask.shape) == 2
+
+
+def _materialize_semantic_attention_mask(attention_mask):
+  if attention_mask is None:
+    return None
+  if isinstance(attention_mask, np.ndarray):
+    return attention_mask
+  return attention_mask[(slice(0, attention_mask.shape[0]), slice(0, attention_mask.shape[1]))]
+
+
+def _pad_dense_mask_to_shape(mask: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+  if mask.shape == shape:
+    return mask
+  if mask.shape[0] > shape[0] or mask.shape[1] > shape[1]:
+    return mask[: shape[0], : shape[1]]
+  padded = np.ones(shape, dtype=np.bool_)
+  padded[: mask.shape[0], : mask.shape[1]] = mask
+  return padded
+
+
+def _make_flash_attention_mask(attention_mask, shape: tuple[int, int], attention_kernel: str):
+  """Builds the Splash mask object for full or semantic attention masks."""
+  if attention_mask is None:
+    if attention_kernel in ["tokamax_flash", "tokamax_ring"]:
+      return tokamax_splash_attention_mask.FullMask(_shape=shape)
+    return splash_attention_mask.FullMask(_shape=shape)
+
+  if isinstance(attention_mask, tokamax_splash_attention_mask.FramewiseCausalMask):
+    if attention_kernel in ["tokamax_flash", "tokamax_ring"]:
+      return tokamax_splash_attention_mask.FramewiseCausalMask(
+          shape=shape,
+          tokens_per_frame=attention_mask.tokens_per_frame,
+      )
+    dense_mask = attention_mask[(slice(0, shape[0]), slice(0, shape[1]))]
+    return splash_attention_mask.NumpyMask(_pad_dense_mask_to_shape(dense_mask, shape))
+
+  if attention_kernel in ["tokamax_flash", "tokamax_ring"]:
+    if isinstance(attention_mask, tokamax_splash_attention_mask.Mask) and attention_mask.shape == shape:
+      return attention_mask
+    dense_mask = _materialize_semantic_attention_mask(attention_mask)
+    return tokamax_splash_attention_mask.NumpyMask(_pad_dense_mask_to_shape(dense_mask, shape))
+
+  dense_mask = _materialize_semantic_attention_mask(attention_mask)
+  return splash_attention_mask.NumpyMask(_pad_dense_mask_to_shape(dense_mask, shape))
+
+
 def _select_flash_block_sizes(
     query: Array,
     key: Array,
@@ -366,8 +422,8 @@ def _tpu_flash_attention(
     key, _, key_seq_len = _pad_data_for_flash(key, heads, block_kv)
     value, _, _ = _pad_data_for_flash(value, heads, block_kv)
 
-    mask = splash_attention_mask.FullMask(_shape=(query.shape[2], key.shape[2]))
-    multi_head_mask = splash_attention_mask.MultiHeadMask(masks=(mask,) * query.shape[1])
+    semantic_attention_mask = attention_mask if _is_semantic_attention_mask(attention_mask) else None
+    mask = _make_flash_attention_mask(semantic_attention_mask, (query.shape[2], key.shape[2]), attention_kernel)
 
     q_padded_len = query.shape[2]
     q_indices = jax.lax.broadcasted_iota(jnp.int32, (q_padded_len,), 0)
@@ -377,8 +433,8 @@ def _tpu_flash_attention(
     kv_indices = jax.lax.broadcasted_iota(jnp.int32, (kv_padded_len,), 0)
     kv_segment_ids = (kv_indices < key_seq_len).astype(jnp.int32)
 
-    # If attention_mask is provided, apply it to kv_segment_ids
-    if attention_mask is not None:
+    # If a padding mask is provided, apply it to kv_segment_ids.
+    if attention_mask is not None and semantic_attention_mask is None:
       mask_len = min(key_seq_len, attention_mask.shape[1])
       kv_mask_for_batch = attention_mask[0, :mask_len]  # (mask_len,)
       # If key_seq_len > mask_len, pad the mask with 1s (assume remaining tokens are valid)
@@ -402,9 +458,6 @@ def _tpu_flash_attention(
     # make_splash_mha is wrapped around shardmap and seq and head is already
     # sharded based on in_specs, therefore setting head_shards=1 and q_seq_shards=1.
     if attention_kernel == "tokamax_flash":
-      mask = tokamax_splash_attention_mask.FullMask(
-          _shape=(query.shape[2], key.shape[2]),
-      )
       splash_kernel = tokamax_splash_attention_kernel.make_splash_mha(
           mask=mask,
           q_seq_shards=1,  # the sizes of the axis is sharding over seq_len
@@ -417,9 +470,6 @@ def _tpu_flash_attention(
           save_residuals=False,
       )
     elif attention_kernel == "tokamax_ring":
-      mask = tokamax_splash_attention_mask.FullMask(
-          _shape=(query.shape[2], key.shape[2]),
-      )
       splash_kernel = tokamax_ring_attention_kernel.make_ring_attention(
           mask=mask,
           is_mqa=False,
@@ -434,6 +484,7 @@ def _tpu_flash_attention(
           rotate_segment_ids=False,  # We don't rotate segment ids in tokamax ring attention because our segment ids is for padding each kv shard has same segment ids
       )
     else:
+      multi_head_mask = splash_attention_mask.MultiHeadMask(masks=(mask,) * query.shape[1])
       splash_kernel = splash_attention_kernel.make_splash_mha(
           mask=multi_head_mask,
           head_shards=1,  # the sizes of the axis is sharding over heads
@@ -715,6 +766,7 @@ def _apply_attention_dot(
     split_head_dim: bool,
     float32_qk_product: bool,
     use_memory_efficient_attention: bool,
+    attention_mask=None,
 ):
   """Apply Attention."""
   if split_head_dim:
@@ -730,6 +782,10 @@ def _apply_attention_dot(
   if float32_qk_product:
     query_states = query_states.astype(jnp.float32)
     key_states = key_states.astype(jnp.float32)
+
+  semantic_attention_mask = attention_mask if _is_semantic_attention_mask(attention_mask) else None
+  if use_memory_efficient_attention and semantic_attention_mask is not None:
+    raise ValueError("memory efficient dot-product attention does not support semantic attention masks.")
 
   if use_memory_efficient_attention:
     query_states = query_states.transpose(1, 0, 2)
@@ -765,6 +821,13 @@ def _apply_attention_dot(
       attention_scores = jnp.einsum("b i d, b j d->b i j", query_states, key_states)
 
     attention_scores = attention_scores * scale
+    if semantic_attention_mask is not None:
+      mask = jnp.asarray(_materialize_semantic_attention_mask(semantic_attention_mask), dtype=jnp.bool_)
+      mask_value = jnp.array(-0.7 * float(np.finfo(np.dtype("float32")).max), dtype=attention_scores.dtype)
+      if split_head_dim:
+        attention_scores = jnp.where(mask[None, None, :, :], attention_scores, mask_value)
+      else:
+        attention_scores = jnp.where(mask[None, :, :], attention_scores, mask_value)
     attention_probs = nn.softmax(attention_scores, axis=-1 if split_head_dim else 2)
 
     attention_probs = attention_probs.astype(dtype)
@@ -826,6 +889,7 @@ def dot_product_kernel(q, k, v, context):
       context["split_head_dim"],
       context["float32_qk_product"],
       context["use_memory_efficient_attention"],
+      attention_mask=context["attention_mask"],
   )
 
 
@@ -1391,6 +1455,7 @@ class FlaxWanAttention(nnx.Module):
       axis_names_kv = (BATCH, CROSS_ATTN_HEAD, CROSS_ATTN_KV_LENGTH, D_KV)
     if attention_kernel == "tokamax_ring" and not is_self_attention:
       attention_kernel = "tokamax_flash"  # do not use ring attention for cross attention
+    self.is_self_attention = is_self_attention
     self.added_kv_proj_dim = added_kv_proj_dim  # New for I2V
     self.image_seq_len = image_seq_len  # New for I2V
     tpu_type = get_tpu_type()
@@ -1583,6 +1648,7 @@ class FlaxWanAttention(nnx.Module):
       encoder_hidden_states: jax.Array = None,
       rotary_emb: Optional[jax.Array] = None,
       encoder_attention_mask: Optional[jax.Array] = None,
+      self_attention_mask=None,
       deterministic: bool = True,
       rngs: nnx.Rngs = None,
       cached_kv: Optional[Dict[str, Tuple[jax.Array, jax.Array]]] = None,
@@ -1591,7 +1657,7 @@ class FlaxWanAttention(nnx.Module):
     hidden_states = jax.lax.with_sharding_constraint(hidden_states, axis_names)
     encoder_hidden_states = jax.lax.with_sharding_constraint(encoder_hidden_states, axis_names)
     dtype = hidden_states.dtype
-    is_self_attention = encoder_hidden_states is None
+    is_self_attention = self.is_self_attention
     if encoder_hidden_states is None:
       encoder_hidden_states = hidden_states
 
@@ -1599,8 +1665,10 @@ class FlaxWanAttention(nnx.Module):
 
     # For T2V self-attention and cross-attention, we skip passing the mask
     # to avoid overhead, as it should be all 1s for unpadded sequences.
-    if not is_i2v_cross_attention:
+    if not is_i2v_cross_attention and not is_self_attention:
       encoder_attention_mask = None
+    if is_self_attention and self_attention_mask is not None:
+      encoder_attention_mask = self_attention_mask
 
     if not is_i2v_cross_attention:
       with jax.named_scope("query_proj"):

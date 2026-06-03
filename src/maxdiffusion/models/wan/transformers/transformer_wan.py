@@ -36,6 +36,7 @@ from ...embeddings_flax import (
 from ...normalization_flax import FP32LayerNorm
 from ...attention_flax import FlaxWanAttention
 from ...gradient_checkpoint import GradientCheckpointType
+from ....kernels.splash_attention import splash_attention_mask as tokamax_splash_attention_mask
 
 BlockSizes = common_types.BlockSizes
 
@@ -443,6 +444,7 @@ class WanTransformerBlock(nnx.Module):
       deterministic: bool = True,
       rngs: nnx.Rngs = None,
       encoder_attention_mask: Optional[jax.Array] = None,
+      self_attention_mask: Optional[Any] = None,
       cached_kv: Optional[Dict[str, Tuple[jax.Array, jax.Array]]] = None,
   ):
     with self.conditional_named_scope("transformer_block"):
@@ -488,6 +490,7 @@ class WanTransformerBlock(nnx.Module):
               hidden_states=norm_hidden_states,
               encoder_hidden_states=norm_hidden_states,
               rotary_emb=rotary_emb,
+              self_attention_mask=self_attention_mask,
               deterministic=deterministic,
               rngs=rngs,
           )
@@ -572,12 +575,14 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
       enable_jax_named_scopes: bool = False,
       use_base2_exp: bool = False,
       use_experimental_scheduler: bool = False,
+      framewise_causal_attention: bool = False,
   ):
     inner_dim = num_attention_heads * attention_head_dim
     out_channels = out_channels or in_channels
     self.num_layers = num_layers
     self.scan_layers = scan_layers
     self.enable_jax_named_scopes = enable_jax_named_scopes
+    self.framewise_causal_attention = framewise_causal_attention
 
     # 1. Patch & position embedding
     self.rope = WanRotaryPosEmbed(attention_head_dim, patch_size, rope_max_seq_len)
@@ -832,6 +837,14 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
     else:
       encoder_hidden_states = encoder_hidden_states_out.astype(hidden_states.dtype)
 
+    self_attention_mask = None
+    if self.framewise_causal_attention:
+      tokens_per_frame = post_patch_height * post_patch_width
+      self_attention_mask = tokamax_splash_attention_mask.FramewiseCausalMask(
+          shape=(hidden_states.shape[1], hidden_states.shape[1]),
+          tokens_per_frame=tokens_per_frame,
+      )
+
     def _run_all_blocks(h):
       if self.scan_layers:
 
@@ -851,6 +864,7 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
               deterministic,
               rngs_carry,
               encoder_attention_mask,
+              self_attention_mask,
               cached_kv=layer_kv_cache,
           )
           new_carry = (hidden_states, rngs_carry)
@@ -893,6 +907,7 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
                 deterministic,
                 rngs,
                 encoder_attention_mask=encoder_attention_mask,
+                self_attention_mask=self_attention_mask,
                 cached_kv=l_kv,
             )
 

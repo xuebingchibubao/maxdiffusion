@@ -346,6 +346,56 @@ class ChunkedCausalMask(_ComputableMask):
     ))
 
 
+class FramewiseCausalMask(_ComputableMask):
+  """Lazy framewise causal mask.
+
+  Tokens are laid out frame-major. A token from frame t may attend to all
+  spatial tokens in frames <= t, including the whole current frame, but not to
+  tokens from future frames.
+  """
+
+  tokens_per_frame: int
+
+  def __init__(
+      self,
+      shape: tuple[int, int],
+      tokens_per_frame: int,
+      shard_count: int = 1,
+  ):
+    if tokens_per_frame <= 0:
+      raise ValueError("tokens_per_frame must be positive")
+    self.tokens_per_frame = tokens_per_frame
+
+    def framewise_causal_mask_function(q_ids, kv_ids):
+      q_frame = q_ids // self.tokens_per_frame
+      kv_frame = kv_ids // self.tokens_per_frame
+      return q_frame >= kv_frame
+
+    super().__init__(
+        shape=shape,
+        mask_function=framewise_causal_mask_function,
+        shard_count=shard_count,
+    )
+
+  def __eq__(self, other: object):
+    if not isinstance(other, type(self)):
+      return NotImplemented
+
+    return (
+        self.shape == other.shape
+        and self.tokens_per_frame == other.tokens_per_frame
+        and np.array_equal(self.q_sequence, other.q_sequence)
+    )
+
+  def __hash__(self):
+    return hash((
+        type(self),
+        self.shape,
+        self.tokens_per_frame,
+        self.q_sequence.tobytes() if self.q_sequence is not None else None,
+    ))
+
+
 class LocalMask(_ComputableMask):
   """Lazy local mask, prevents model from attending to tokens outside window.
 
