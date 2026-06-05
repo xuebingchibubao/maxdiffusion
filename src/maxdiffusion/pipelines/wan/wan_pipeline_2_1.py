@@ -25,6 +25,293 @@ from ...schedulers.scheduling_unipc_multistep_flax import FlaxUniPCMultistepSche
 import numpy as np
 import time
 from ... import max_utils
+from .wan_framewise_ar_utils import (
+    append_self_kv_cache,
+    make_framewise_ar_timestep,
+    replace_latent_frame_block,
+    reset_scheduler_state_for_ar_block,
+)
+
+
+def run_framewise_ar_inference_2_1(
+    graphdef,
+    sharded_state,
+    rest_of_state,
+    latents: jnp.array,
+    prompt_embeds: jnp.array,
+    negative_prompt_embeds: jnp.array,
+    guidance_scale: float,
+    num_inference_steps: int,
+    scheduler: FlaxUniPCMultistepScheduler,
+    scheduler_state,
+    config=None,
+    use_cfg_cache: bool = False,
+    use_magcache: bool = False,
+    use_kv_cache: bool = False,
+):
+  """Causal-Forcing-style framewise AR denoising.
+
+  This path preserves the official AR sampling order. When
+  framewise_ar_use_self_kv_cache=True, clean video history is carried through a
+  per-layer self-attention KV cache and only the current frame block is forwarded.
+  """
+  if use_cfg_cache:
+    raise ValueError("framewise_ar_inference=True is not compatible with use_cfg_cache=True.")
+  if use_magcache:
+    raise ValueError("framewise_ar_inference=True is not compatible with use_magcache=True.")
+  if not getattr(config, "framewise_causal_attention", False):
+    raise ValueError("framewise_ar_inference=True requires framewise_causal_attention=True.")
+
+  do_cfg = guidance_scale > 1.0
+  bsz = latents.shape[0]
+  prompt_cond_embeds = prompt_embeds
+  prompt_embeds_combined = None
+  if do_cfg:
+    prompt_embeds_combined = jnp.concatenate([prompt_embeds, negative_prompt_embeds], axis=0)
+
+  transformer_obj = nnx.merge(graphdef, sharded_state, rest_of_state)
+  p_t, p_h, p_w = transformer_obj.config.patch_size
+  if p_t != 1:
+    raise ValueError("framewise_ar_inference=True currently requires Wan temporal patch size p_t=1.")
+
+  latent_num_frames = latents.shape[2]
+  post_patch_height = latents.shape[3] // p_h
+  post_patch_width = latents.shape[4] // p_w
+  tokens_per_frame = post_patch_height * post_patch_width
+  seq_len = latent_num_frames * tokens_per_frame
+  num_frames_per_block = int(getattr(config, "framewise_ar_num_frames_per_block", 1)) if config else 1
+  if num_frames_per_block < 1:
+    raise ValueError("framewise_ar_num_frames_per_block must be >= 1.")
+
+  full_dummy_hidden_states = jnp.zeros((
+      latents.shape[0],
+      latents.shape[2],
+      latents.shape[3],
+      latents.shape[4],
+      latents.shape[1],
+  ))
+  full_rotary_emb = transformer_obj.rope(full_dummy_hidden_states)
+
+  use_self_kv_cache = bool(getattr(config, "framewise_ar_use_self_kv_cache", True)) if config else True
+  kv_cache = None
+  kv_cache_cond = None
+  kv_cache_uncond = None
+  encoder_attention_mask = None
+  encoder_attention_mask_cond = None
+  encoder_attention_mask_uncond = None
+  if use_kv_cache:
+    if use_self_kv_cache and do_cfg:
+      kv_cache_cond, encoder_attention_mask_cond = transformer_obj.compute_kv_cache(prompt_cond_embeds)
+      kv_cache_uncond, encoder_attention_mask_uncond = transformer_obj.compute_kv_cache(negative_prompt_embeds)
+    else:
+      kv_cache, encoder_attention_mask = transformer_obj.compute_kv_cache(
+          prompt_embeds_combined if do_cfg else prompt_cond_embeds
+      )
+
+  timesteps = jnp.array(scheduler_state.timesteps, dtype=jnp.int32)
+  generated_latents = latents
+
+  if use_self_kv_cache:
+    if num_frames_per_block != 1:
+      raise ValueError("framewise_ar_use_self_kv_cache=True currently requires framewise_ar_num_frames_per_block=1.")
+
+    self_kv_cache = None
+    self_kv_cache_cond = None
+    self_kv_cache_uncond = None
+    for frame_start in range(0, latent_num_frames, num_frames_per_block):
+      current_num_frames = min(num_frames_per_block, latent_num_frames - frame_start)
+      current_latents = generated_latents[:, :, frame_start : frame_start + current_num_frames]
+      current_seq_len = current_num_frames * tokens_per_frame
+      token_start = frame_start * tokens_per_frame
+      token_end = token_start + current_seq_len
+      current_rotary_emb = full_rotary_emb[:, :, token_start:token_end, :]
+      frame_scheduler_state = scheduler.set_timesteps(
+          scheduler_state,
+          num_inference_steps=num_inference_steps,
+          shape=current_latents.shape,
+      )
+
+      for step in range(num_inference_steps):
+        t = timesteps[step]
+
+        if do_cfg:
+          timestep = jnp.broadcast_to(t, (bsz, current_seq_len))
+          noise_cond, _ = transformer_forward_pass(
+              graphdef,
+              sharded_state,
+              rest_of_state,
+              current_latents,
+              timestep,
+              prompt_cond_embeds,
+              do_classifier_free_guidance=False,
+              guidance_scale=guidance_scale,
+              kv_cache=kv_cache_cond,
+              self_kv_cache=self_kv_cache_cond,
+              rotary_emb=current_rotary_emb,
+              encoder_attention_mask=encoder_attention_mask_cond,
+          )
+          noise_uncond, _ = transformer_forward_pass(
+              graphdef,
+              sharded_state,
+              rest_of_state,
+              current_latents,
+              timestep,
+              negative_prompt_embeds,
+              do_classifier_free_guidance=False,
+              guidance_scale=guidance_scale,
+              kv_cache=kv_cache_uncond,
+              self_kv_cache=self_kv_cache_uncond,
+              rotary_emb=current_rotary_emb,
+              encoder_attention_mask=encoder_attention_mask_uncond,
+          )
+          noise_pred = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
+        else:
+          timestep = jnp.broadcast_to(t, (bsz, current_seq_len))
+          noise_pred, _ = transformer_forward_pass(
+              graphdef,
+              sharded_state,
+              rest_of_state,
+              current_latents,
+              timestep,
+              prompt_cond_embeds,
+              do_classifier_free_guidance=False,
+              guidance_scale=guidance_scale,
+              kv_cache=kv_cache,
+              self_kv_cache=self_kv_cache,
+              rotary_emb=current_rotary_emb,
+              encoder_attention_mask=encoder_attention_mask,
+          )
+
+        current_latents, frame_scheduler_state = scheduler.step(
+            frame_scheduler_state, noise_pred, t, current_latents, return_dict=False
+        )
+
+      generated_latents = replace_latent_frame_block(
+          generated_latents,
+          current_latents,
+          frame_start,
+          current_num_frames,
+      )
+
+      cache_timestep = jnp.zeros((bsz, current_seq_len), dtype=timesteps.dtype)
+      if do_cfg:
+        _, _, present_self_kv_cond = transformer_forward_pass(
+            graphdef,
+            sharded_state,
+            rest_of_state,
+            current_latents,
+            cache_timestep,
+            prompt_cond_embeds,
+            do_classifier_free_guidance=False,
+            guidance_scale=guidance_scale,
+            kv_cache=kv_cache_cond,
+            self_kv_cache=self_kv_cache_cond,
+            return_self_kv=True,
+            rotary_emb=current_rotary_emb,
+            encoder_attention_mask=encoder_attention_mask_cond,
+        )
+        self_kv_cache_cond = append_self_kv_cache(self_kv_cache_cond, present_self_kv_cond)
+        _, _, present_self_kv_uncond = transformer_forward_pass(
+            graphdef,
+            sharded_state,
+            rest_of_state,
+            current_latents,
+            cache_timestep,
+            negative_prompt_embeds,
+            do_classifier_free_guidance=False,
+            guidance_scale=guidance_scale,
+            kv_cache=kv_cache_uncond,
+            self_kv_cache=self_kv_cache_uncond,
+            return_self_kv=True,
+            rotary_emb=current_rotary_emb,
+            encoder_attention_mask=encoder_attention_mask_uncond,
+        )
+        self_kv_cache_uncond = append_self_kv_cache(self_kv_cache_uncond, present_self_kv_uncond)
+      else:
+        _, _, present_self_kv = transformer_forward_pass(
+            graphdef,
+            sharded_state,
+            rest_of_state,
+            current_latents,
+            cache_timestep,
+            prompt_cond_embeds,
+            do_classifier_free_guidance=False,
+            guidance_scale=guidance_scale,
+            kv_cache=kv_cache,
+            self_kv_cache=self_kv_cache,
+            return_self_kv=True,
+            rotary_emb=current_rotary_emb,
+            encoder_attention_mask=encoder_attention_mask,
+        )
+        self_kv_cache = append_self_kv_cache(self_kv_cache, present_self_kv)
+
+    return generated_latents
+
+  rotary_emb = full_rotary_emb
+
+  for frame_start in range(0, latent_num_frames, num_frames_per_block):
+    current_num_frames = min(num_frames_per_block, latent_num_frames - frame_start)
+    frame_scheduler_state = reset_scheduler_state_for_ar_block(scheduler_state)
+
+    for step in range(num_inference_steps):
+      t = timesteps[step]
+
+      if do_cfg:
+        latents_doubled = jnp.concatenate([generated_latents] * 2)
+        timestep = make_framewise_ar_timestep(
+            t,
+            bsz * 2,
+            seq_len,
+            tokens_per_frame,
+            frame_start,
+            current_num_frames,
+        )
+        noise_pred, _, _ = transformer_forward_pass_full_cfg(
+            graphdef,
+            sharded_state,
+            rest_of_state,
+            latents_doubled,
+            timestep,
+            prompt_embeds_combined,
+            guidance_scale=guidance_scale,
+            kv_cache=kv_cache,
+            rotary_emb=rotary_emb,
+            encoder_attention_mask=encoder_attention_mask,
+        )
+      else:
+        timestep = make_framewise_ar_timestep(
+            t,
+            bsz,
+            seq_len,
+            tokens_per_frame,
+            frame_start,
+            current_num_frames,
+        )
+        noise_pred, _ = transformer_forward_pass(
+            graphdef,
+            sharded_state,
+            rest_of_state,
+            generated_latents,
+            timestep,
+            prompt_cond_embeds,
+            do_classifier_free_guidance=False,
+            guidance_scale=guidance_scale,
+            kv_cache=kv_cache,
+            rotary_emb=rotary_emb,
+            encoder_attention_mask=encoder_attention_mask,
+        )
+
+      new_latents, frame_scheduler_state = scheduler.step(
+          frame_scheduler_state, noise_pred, t, generated_latents, return_dict=False
+      )
+      generated_latents = replace_latent_frame_block(
+          generated_latents,
+          new_latents,
+          frame_start,
+          current_num_frames,
+      )
+
+  return generated_latents
 
 
 class WanPipeline2_1(WanPipeline):
@@ -228,6 +515,24 @@ def run_inference_2_1(
   """
   do_cfg = guidance_scale > 1.0
   bsz = latents.shape[0]
+
+  if getattr(config, "framewise_ar_inference", False):
+    return run_framewise_ar_inference_2_1(
+        graphdef=graphdef,
+        sharded_state=sharded_state,
+        rest_of_state=rest_of_state,
+        latents=latents,
+        prompt_embeds=prompt_embeds,
+        negative_prompt_embeds=negative_prompt_embeds,
+        guidance_scale=guidance_scale,
+        num_inference_steps=num_inference_steps,
+        scheduler=scheduler,
+        scheduler_state=scheduler_state,
+        config=config,
+        use_cfg_cache=use_cfg_cache,
+        use_magcache=use_magcache,
+        use_kv_cache=use_kv_cache,
+    )
 
   # Resolution-dependent CFG cache config (FasterCache / MixCache guidance)
   if height >= 720:

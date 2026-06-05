@@ -1,0 +1,3 @@
+html文档需要包含以下几个方面：
+1.以5帧，每帧4个patch为例，演示一下full attention和frameWiseMasked attention之间的区别，用赤橙黄绿青色分别表示这五个不同帧对应的token，attention map左边和上边分别加上相应颜色的token。
+2.把涉及到的FrameWiseMask形状计算过程的代码按照调用顺序给分代码块列出来

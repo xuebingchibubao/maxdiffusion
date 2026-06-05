@@ -446,6 +446,8 @@ class WanTransformerBlock(nnx.Module):
       encoder_attention_mask: Optional[jax.Array] = None,
       self_attention_mask: Optional[Any] = None,
       cached_kv: Optional[Dict[str, Tuple[jax.Array, jax.Array]]] = None,
+      self_kv_cache: Optional[Dict[str, Tuple[jax.Array, jax.Array]]] = None,
+      return_self_kv: bool = False,
   ):
     with self.conditional_named_scope("transformer_block"):
       # Support both global [B, 6, dim] and per-token [B, seq_len, 6, dim] temb.
@@ -486,14 +488,21 @@ class WanTransformerBlock(nnx.Module):
               hidden_states.dtype
           )
         with self.conditional_named_scope("self_attn_attn"):
-          attn_output = self.attn1(
+          self_attn_output = self.attn1(
               hidden_states=norm_hidden_states,
               encoder_hidden_states=norm_hidden_states,
               rotary_emb=rotary_emb,
               self_attention_mask=self_attention_mask,
               deterministic=deterministic,
               rngs=rngs,
+              cached_kv=self_kv_cache,
+              return_kv=return_self_kv,
           )
+          present_self_kv = None
+          if return_self_kv:
+            attn_output, present_self_kv = self_attn_output
+          else:
+            attn_output = self_attn_output
         with self.conditional_named_scope("self_attn_residual"):
           hidden_states = (hidden_states.astype(jnp.float32) + attn_output * gate_msa).astype(hidden_states.dtype)
 
@@ -525,6 +534,8 @@ class WanTransformerBlock(nnx.Module):
           hidden_states = (hidden_states.astype(jnp.float32) + ff_output.astype(jnp.float32) * c_gate_msa).astype(
               hidden_states.dtype
           )
+      if return_self_kv:
+        return hidden_states, present_self_kv
       return hidden_states
 
   def compute_kv(
@@ -766,6 +777,8 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
       cached_residual: Optional[jax.Array] = None,
       return_residual: bool = False,
       kv_cache: Optional[Dict[str, Tuple[jax.Array, jax.Array]]] = None,
+      self_kv_cache: Optional[Dict[str, Tuple[jax.Array, jax.Array]]] = None,
+      return_self_kv: bool = False,
       rotary_emb: Optional[jax.Array] = None,
       encoder_attention_mask: Optional[jax.Array] = None,
   ) -> Union[jax.Array, Tuple[jax.Array, jax.Array], Dict[str, jax.Array]]:
@@ -838,7 +851,7 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
       encoder_hidden_states = encoder_hidden_states_out.astype(hidden_states.dtype)
 
     self_attention_mask = None
-    if self.framewise_causal_attention:
+    if self.framewise_causal_attention and self_kv_cache is None:
       tokens_per_frame = post_patch_height * post_patch_width
       self_attention_mask = tokamax_splash_attention_mask.FramewiseCausalMask(
           shape=(hidden_states.shape[1], hidden_states.shape[1]),
@@ -850,13 +863,20 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
 
         def scan_fn(carry, block_input):
           hidden_states_carry, rngs_carry = carry
-          if kv_cache is not None:
+          if kv_cache is not None and self_kv_cache is not None:
+            block, layer_kv_cache, layer_self_kv_cache = block_input
+          elif kv_cache is not None:
             block, layer_kv_cache = block_input
+            layer_self_kv_cache = None
+          elif self_kv_cache is not None:
+            block, layer_self_kv_cache = block_input
+            layer_kv_cache = None
           else:
             block = block_input
             layer_kv_cache = None
+            layer_self_kv_cache = None
 
-          hidden_states = block(
+          block_outputs = block(
               hidden_states_carry,
               encoder_hidden_states,
               timestep_proj,
@@ -866,9 +886,16 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
               encoder_attention_mask,
               self_attention_mask,
               cached_kv=layer_kv_cache,
+              self_kv_cache=layer_self_kv_cache,
+              return_self_kv=return_self_kv,
           )
+          if return_self_kv:
+            hidden_states, present_self_kv = block_outputs
+          else:
+            hidden_states = block_outputs
+            present_self_kv = None
           new_carry = (hidden_states, rngs_carry)
-          return new_carry, None
+          return new_carry, present_self_kv
 
         rematted_block_forward = self.gradient_checkpoint.apply(
             scan_fn,
@@ -878,12 +905,16 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
         )
         initial_carry = (h, rngs)
 
-        if kv_cache is not None:
+        if kv_cache is not None and self_kv_cache is not None:
+          scan_input = (self.blocks, kv_cache, self_kv_cache)
+        elif kv_cache is not None:
           scan_input = (self.blocks, kv_cache)
+        elif self_kv_cache is not None:
+          scan_input = (self.blocks, self_kv_cache)
         else:
           scan_input = self.blocks
 
-        final_carry, _ = nnx.scan(
+        final_carry, self_kv_outputs = nnx.scan(
             rematted_block_forward,
             length=self.num_layers,
             in_axes=(nnx.Carry, 0),
@@ -893,12 +924,16 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
         h_out, _ = final_carry
       else:
         h_out = h
+        self_kv_outputs = []
         for i, block in enumerate(self.blocks):
           layer_kv_cache = None
           if kv_cache is not None:
             layer_kv_cache = jax.tree.map(lambda x: x[i], kv_cache)
+          layer_self_kv_cache = None
+          if self_kv_cache is not None:
+            layer_self_kv_cache = jax.tree.map(lambda x: x[i], self_kv_cache)
 
-          def layer_forward(hidden_states, l_kv):
+          def layer_forward(hidden_states, l_kv, l_self_kv):
             return block(
                 hidden_states,
                 encoder_hidden_states,
@@ -909,6 +944,8 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
                 encoder_attention_mask=encoder_attention_mask,
                 self_attention_mask=self_attention_mask,
                 cached_kv=l_kv,
+                self_kv_cache=l_self_kv,
+                return_self_kv=return_self_kv,
             )
 
           rematted_layer_forward = self.gradient_checkpoint.apply(
@@ -917,17 +954,39 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
               self.names_which_can_be_offloaded,
               prevent_cse=not self.scan_layers,
           )
-          h_out = rematted_layer_forward(h_out, layer_kv_cache)
+          layer_outputs = rematted_layer_forward(h_out, layer_kv_cache, layer_self_kv_cache)
+          if return_self_kv:
+            h_out, present_self_kv = layer_outputs
+            self_kv_outputs.append(present_self_kv)
+          else:
+            h_out = layer_outputs
+        if return_self_kv:
+          keys = self_kv_outputs[0].keys()
+          stacked_self_kv = {}
+          for k in keys:
+            k_list = [d[k][0] for d in self_kv_outputs]
+            v_list = [d[k][1] for d in self_kv_outputs]
+            stacked_self_kv[k] = (jnp.stack(k_list, axis=0), jnp.stack(v_list, axis=0))
+          self_kv_outputs = stacked_self_kv
+      if return_self_kv:
+        return h_out, self_kv_outputs
       return h_out
 
     hidden_states_before_blocks = hidden_states
+
+    if return_self_kv and skip_blocks:
+      raise ValueError("return_self_kv=True is not supported when skip_blocks=True.")
 
     if skip_blocks:
       if cached_residual is None:
         raise ValueError("cached_residual must be provided when skip_blocks is True")
       hidden_states = hidden_states + cached_residual
     else:
-      hidden_states = _run_all_blocks(hidden_states)
+      block_outputs = _run_all_blocks(hidden_states)
+      if return_self_kv:
+        hidden_states, present_self_kv = block_outputs
+      else:
+        hidden_states = block_outputs
 
     residual_x = hidden_states - hidden_states_before_blocks
 
@@ -956,6 +1015,8 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
     hidden_states = jnp.transpose(hidden_states, (0, 7, 1, 4, 2, 5, 3, 6))
     hidden_states = hidden_states.reshape(batch_size, -1, num_frames, height, width)
 
+    if return_self_kv:
+      return hidden_states, present_self_kv
     if return_residual:
       return hidden_states, residual_x
     return hidden_states

@@ -85,6 +85,9 @@ use_base2_exp: True
 use_experimental_scheduler: True
 flash_min_seq_length: 0
 framewise_causal_attention: True
+framewise_ar_inference: True
+framewise_ar_num_frames_per_block: 1
+framewise_ar_use_self_kv_cache: True
 
 # If mask_padding_tokens is True, we pass in segment ids to splash attention to avoid attending to padding tokens.
 # Else we do not pass in segment ids and on vpu bound hardware like trillium this is faster.
@@ -322,7 +325,8 @@ height: 480
 width: 832
 num_frames: 81
 guidance_scale: 3.0
-flow_shift: 3.0
+# Causal-Forcing framewise AR checkpoints are trained/inferred with timestep_shift=5.0.
+flow_shift: 5.0
 
 # Diffusion CFG cache (FasterCache-style, WAN 2.1 T2V only)
 use_cfg_cache: False
@@ -341,7 +345,7 @@ scan_diffusion_loop: False
 
 # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
 guidance_rescale: 0.0
-num_inference_steps: 30
+num_inference_steps: 50
 fps: 16
 save_final_checkpoint: False
 

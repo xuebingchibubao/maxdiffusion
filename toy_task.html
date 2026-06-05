@@ -1,0 +1,730 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>toy_task - Framewise Causal Mask</title>
+  <style>
+    :root {
+      --bg: #fafafa;
+      --ink: #1f2328;
+      --muted: #626c76;
+      --line: #d8dee4;
+      --soft: #f1f4f3;
+      --accent: #16695c;
+      --accent-2: #2f6f9f;
+      --blocked: #e6e8ea;
+      --code-bg: #202932;
+      --code-fg: #eef4f8;
+      --f0: #d94b40;
+      --f1: #e8892e;
+      --f2: #d5b424;
+      --f3: #31985b;
+      --f4: #20a4b8;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.6;
+    }
+
+    main {
+      max-width: 1080px;
+      margin: 0 auto;
+      padding: 36px 20px 64px;
+    }
+
+    header {
+      padding-bottom: 22px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    h1,
+    h2,
+    h3 {
+      margin: 0;
+      line-height: 1.25;
+      letter-spacing: 0;
+    }
+
+    h1 {
+      max-width: 760px;
+      font-size: 38px;
+    }
+
+    h2 {
+      margin-top: 34px;
+      margin-bottom: 14px;
+      font-size: 24px;
+    }
+
+    h3 {
+      margin-bottom: 8px;
+      font-size: 17px;
+    }
+
+    p {
+      margin: 8px 0;
+    }
+
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.94em;
+    }
+
+    .subtitle {
+      max-width: 820px;
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 16px;
+    }
+
+    .facts {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 18px;
+    }
+
+    .fact {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      padding: 12px;
+    }
+
+    .fact b {
+      display: block;
+      color: var(--accent);
+      font-size: 20px;
+    }
+
+    .fact span {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .section {
+      padding: 26px 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .two-col {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 22px;
+      align-items: start;
+    }
+
+    .frames {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 8px;
+      margin-top: 16px;
+    }
+
+    .frame {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      padding: 10px;
+    }
+
+    .frame-title {
+      margin-bottom: 8px;
+      color: var(--accent);
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .patches {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 5px;
+    }
+
+    .patch {
+      display: grid;
+      place-items: center;
+      min-height: 30px;
+      border-radius: 6px;
+      color: #fff;
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .f0 {
+      background: var(--f0);
+    }
+
+    .f1 {
+      background: var(--f1);
+    }
+
+    .f2 {
+      background: var(--f2);
+      color: #2f2a00;
+    }
+
+    .f3 {
+      background: var(--f3);
+    }
+
+    .f4 {
+      background: var(--f4);
+    }
+
+    .matrix-title {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: baseline;
+      margin-bottom: 10px;
+    }
+
+    .matrix-title span {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .attention-map {
+      display: grid;
+      grid-template-columns: 30px repeat(20, minmax(10px, 1fr));
+      gap: 2px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      padding: 8px;
+      overflow-x: auto;
+    }
+
+    .corner,
+    .token-axis,
+    .attn-cell {
+      display: grid;
+      place-items: center;
+      aspect-ratio: 1;
+      min-width: 10px;
+      border-radius: 3px;
+      font-size: 9px;
+      font-weight: 700;
+    }
+
+    .corner {
+      background: transparent;
+      color: var(--muted);
+    }
+
+    .token-axis {
+      color: #fff;
+    }
+
+    .token-axis.f2 {
+      color: #2f2a00;
+    }
+
+    .attn-cell {
+      border: 1px solid rgba(0, 0, 0, 0.04);
+      background: var(--blocked);
+      color: transparent;
+    }
+
+    .attn-cell.full {
+      background: rgba(47, 111, 159, 0.72);
+    }
+
+    .attn-cell.allowed {
+      background: rgba(22, 105, 92, 0.78);
+    }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px;
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .legend-item {
+      display: inline-flex;
+      gap: 6px;
+      align-items: center;
+    }
+
+    .swatch {
+      width: 13px;
+      height: 13px;
+      border-radius: 4px;
+      border: 1px solid var(--line);
+    }
+
+    .swatch.full {
+      background: var(--accent-2);
+    }
+
+    .swatch.allowed {
+      background: var(--accent);
+    }
+
+    .swatch.blocked {
+      background: var(--blocked);
+    }
+
+    .swatch.f0 {
+      background: var(--f0);
+    }
+
+    .swatch.f1 {
+      background: var(--f1);
+    }
+
+    .swatch.f2 {
+      background: var(--f2);
+    }
+
+    .swatch.f3 {
+      background: var(--f3);
+    }
+
+    .swatch.f4 {
+      background: var(--f4);
+    }
+
+    .note {
+      margin-top: 12px;
+      border-left: 4px solid var(--accent);
+      background: #edf6f3;
+      border-radius: 8px;
+      padding: 12px 14px;
+      color: #214942;
+    }
+
+    .steps {
+      display: grid;
+      gap: 16px;
+    }
+
+    .step {
+      display: grid;
+      grid-template-columns: 40px minmax(0, 1fr);
+      gap: 12px;
+      align-items: start;
+    }
+
+    .step-num {
+      display: grid;
+      place-items: center;
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      background: #dcece8;
+      color: var(--accent);
+      font-weight: 800;
+    }
+
+    .path {
+      margin-top: 2px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    pre {
+      margin: 10px 0 0;
+      overflow-x: auto;
+      border-radius: 8px;
+      background: var(--code-bg);
+      color: var(--code-fg);
+      padding: 14px 15px;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    pre code {
+      color: inherit;
+      font-size: inherit;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 12px;
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    th,
+    td {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: var(--soft);
+      font-weight: 700;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    @media (max-width: 760px) {
+      main {
+        padding: 26px 14px 48px;
+      }
+
+      h1 {
+        font-size: 29px;
+      }
+
+      .facts,
+      .two-col,
+      .frames {
+        grid-template-columns: 1fr;
+      }
+
+      .attention-map {
+        grid-template-columns: 24px repeat(20, 12px);
+      }
+
+      .token-axis,
+      .attn-cell,
+      .corner {
+        font-size: 11px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>toy_task: Framewise Causal Mask</h1>
+      <p class="subtitle">
+        这个文档只聚焦两个问题：用一个 5 帧、每帧 4 个 patch 的例子说明 full attention
+        和 framewise masked attention 的差别；再按 MaxDiffusion 当前代码调用顺序列出
+        FramewiseMask 形状计算相关代码。
+      </p>
+      <div class="facts">
+        <div class="fact"><b>5</b><span>toy frames</span></div>
+        <div class="fact"><b>4</b><span>patches per frame</span></div>
+        <div class="fact"><b>20</b><span>video tokens</span></div>
+        <div class="fact"><b>20 x 20</b><span>attention mask shape</span></div>
+      </div>
+    </header>
+
+    <section class="section">
+      <h2>1. Toy Token Layout</h2>
+      <p>
+        Wan patch embedding 后，video tokens 采用 frame-major 顺序排列：先是 frame 0 的所有 patch，
+        然后是 frame 1 的所有 patch，以此类推。对于 5 帧、每帧 4 个 patch：
+      </p>
+      <div class="frames">
+        <div class="frame">
+          <div class="frame-title">frame 0</div>
+          <div class="patches"><div class="patch f0">0</div><div class="patch f0">1</div><div class="patch f0">2</div><div class="patch f0">3</div></div>
+        </div>
+        <div class="frame">
+          <div class="frame-title">frame 1</div>
+          <div class="patches"><div class="patch f1">4</div><div class="patch f1">5</div><div class="patch f1">6</div><div class="patch f1">7</div></div>
+        </div>
+        <div class="frame">
+          <div class="frame-title">frame 2</div>
+          <div class="patches"><div class="patch f2">8</div><div class="patch f2">9</div><div class="patch f2">10</div><div class="patch f2">11</div></div>
+        </div>
+        <div class="frame">
+          <div class="frame-title">frame 3</div>
+          <div class="patches"><div class="patch f3">12</div><div class="patch f3">13</div><div class="patch f3">14</div><div class="patch f3">15</div></div>
+        </div>
+        <div class="frame">
+          <div class="frame-title">frame 4</div>
+          <div class="patches"><div class="patch f4">16</div><div class="patch f4">17</div><div class="patch f4">18</div><div class="patch f4">19</div></div>
+        </div>
+      </div>
+      <div class="note">
+        Toy 例子里 <code>tokens_per_frame = 4</code>，所以 <code>frame_id = token_id // 4</code>。
+        下方 attention map 的上边是 key/value tokens，左边是 query tokens；赤、橙、黄、绿、青分别表示 frame 0 到 frame 4。
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>2. Full Attention 和 Framewise Masked Attention</h2>
+      <p>
+        下面直接展示 20 x 20 token attention map。每个小格表示一个 query token 到一个 key/value token
+        的可见性。上边和左边的 token 色条对应 5 个帧的 token 归属。
+      </p>
+      <div class="two-col">
+        <div>
+          <div class="matrix-title">
+            <h3>Full Attention</h3>
+            <span>所有 token pair 可见</span>
+          </div>
+          <div class="attention-map" id="full-map" aria-label="full attention token map"></div>
+          <div class="legend">
+            <span class="legend-item"><span class="swatch full"></span> allowed</span>
+            <span class="legend-item"><span class="swatch f0"></span> frame 0</span>
+            <span class="legend-item"><span class="swatch f1"></span> frame 1</span>
+            <span class="legend-item"><span class="swatch f2"></span> frame 2</span>
+            <span class="legend-item"><span class="swatch f3"></span> frame 3</span>
+            <span class="legend-item"><span class="swatch f4"></span> frame 4</span>
+          </div>
+        </div>
+
+        <div>
+          <div class="matrix-title">
+            <h3>Framewise Masked Attention</h3>
+            <span>q_frame &gt;= kv_frame</span>
+          </div>
+          <div class="attention-map" id="framewise-map" aria-label="framewise masked attention token map"></div>
+          <div class="legend">
+            <span class="legend-item"><span class="swatch allowed"></span> allowed</span>
+            <span class="legend-item"><span class="swatch blocked"></span> blocked</span>
+            <span class="legend-item"><span class="swatch f0"></span> frame 0</span>
+            <span class="legend-item"><span class="swatch f1"></span> frame 1</span>
+            <span class="legend-item"><span class="swatch f2"></span> frame 2</span>
+            <span class="legend-item"><span class="swatch f3"></span> frame 3</span>
+            <span class="legend-item"><span class="swatch f4"></span> frame 4</span>
+          </div>
+        </div>
+      </div>
+
+      <table>
+        <thead>
+          <tr>
+            <th>规则</th>
+            <th>Full attention</th>
+            <th>Framewise masked attention</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>query frame 0</td>
+            <td>可以看 frame 0 到 frame 4</td>
+            <td>只能看 frame 0</td>
+          </tr>
+          <tr>
+            <td>query frame 2</td>
+            <td>可以看 frame 0 到 frame 4</td>
+            <td>只能看 frame 0、1、2</td>
+          </tr>
+          <tr>
+            <td>同一帧内 patch</td>
+            <td>互相可见</td>
+            <td>仍然互相可见</td>
+          </tr>
+          <tr>
+            <td>未来帧</td>
+            <td>可见</td>
+            <td>不可见</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="section">
+      <h2>3. FramewiseMask 形状计算代码调用顺序</h2>
+      <div class="steps">
+        <div class="step">
+          <div class="step-num">1</div>
+          <div>
+            <h3>配置启用 framewise causal attention</h3>
+            <div class="path">src/maxdiffusion/configs/causal_forcing_framewise_ar.yml</div>
+            <pre><code>attention: 'tokamax_flash'
+flash_min_seq_length: 0
+framewise_causal_attention: True</code></pre>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-num">2</div>
+          <div>
+            <h3>pipeline 把开关传进 WanModel config</h3>
+            <div class="path">src/maxdiffusion/pipelines/wan/wan_pipeline.py</div>
+            <pre><code>wan_config["attention"] = config.attention
+wan_config["flash_min_seq_length"] = config.flash_min_seq_length
+wan_config["use_base2_exp"] = config.use_base2_exp
+wan_config["use_experimental_scheduler"] = config.use_experimental_scheduler
+wan_config["framewise_causal_attention"] = getattr(config, "framewise_causal_attention", False)</code></pre>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-num">3</div>
+          <div>
+            <h3>WanModel 初始化时保存开关，并定义 patch embedding</h3>
+            <div class="path">src/maxdiffusion/models/wan/transformers/transformer_wan.py</div>
+            <pre><code>inner_dim = num_attention_heads * attention_head_dim
+self.framewise_causal_attention = framewise_causal_attention
+
+self.patch_embedding = nnx.Conv(
+    in_channels,
+    inner_dim,
+    rngs=rngs,
+    kernel_size=patch_size,
+    strides=patch_size,
+    dtype=dtype,
+    param_dtype=weights_dtype,
+    precision=precision,
+)</code></pre>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-num">4</div>
+          <div>
+            <h3>forward 中读取 latent video shape 和 patch size</h3>
+            <div class="path">src/maxdiffusion/models/wan/transformers/transformer_wan.py</div>
+            <pre><code>batch_size, _, num_frames, height, width = hidden_states.shape
+p_t, p_h, p_w = self.config.patch_size
+post_patch_num_frames = num_frames // p_t
+post_patch_height = height // p_h
+post_patch_width = width // p_w</code></pre>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-num">5</div>
+          <div>
+            <h3>patch embedding 后 flatten temporal/spatial 维度</h3>
+            <div class="path">src/maxdiffusion/models/wan/transformers/transformer_wan.py</div>
+            <pre><code>hidden_states = jnp.transpose(hidden_states, (0, 2, 3, 4, 1))
+hidden_states = self.patch_embedding(hidden_states)
+hidden_states = jax.lax.collapse(hidden_states, 1, -1)</code></pre>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-num">6</div>
+          <div>
+            <h3>用 patch 后空间尺寸计算 mask 参数</h3>
+            <div class="path">src/maxdiffusion/models/wan/transformers/transformer_wan.py</div>
+            <pre><code>self_attention_mask = None
+if self.framewise_causal_attention:
+  tokens_per_frame = post_patch_height * post_patch_width
+  self_attention_mask = tokamax_splash_attention_mask.FramewiseCausalMask(
+      shape=(hidden_states.shape[1], hidden_states.shape[1]),
+      tokens_per_frame=tokens_per_frame,
+  )</code></pre>
+            <div class="note">
+              Toy 例子中：<code>post_patch_height * post_patch_width = 4</code>，
+              <code>hidden_states.shape[1] = 5 * 4 = 20</code>，
+              所以 <code>FramewiseCausalMask(shape=(20, 20), tokens_per_frame=4)</code>。
+            </div>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-num">7</div>
+          <div>
+            <h3>FramewiseCausalMask 通过 frame id 判断可见性</h3>
+            <div class="path">src/maxdiffusion/kernels/splash_attention/splash_attention_mask.py</div>
+            <pre><code>def framewise_causal_mask_function(q_ids, kv_ids):
+  q_frame = q_ids // self.tokens_per_frame
+  kv_frame = kv_ids // self.tokens_per_frame
+  return q_frame &gt;= kv_frame</code></pre>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-num">8</div>
+          <div>
+            <h3>进入 Tokamax Splash 时按 padded shape 重建 mask</h3>
+            <div class="path">src/maxdiffusion/models/attention_flax.py</div>
+            <pre><code>if isinstance(attention_mask, tokamax_splash_attention_mask.FramewiseCausalMask):
+  if attention_kernel in ["tokamax_flash", "tokamax_ring"]:
+    return tokamax_splash_attention_mask.FramewiseCausalMask(
+        shape=shape,
+        tokens_per_frame=attention_mask.tokens_per_frame,
+    )</code></pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>4. 当前 MaxDiffusion 配置中的实际数值</h2>
+      <p>
+        当前配置输出 81 帧视频，但 transformer self-attention 工作在 VAE 压缩后的 latent frames 上。
+        对 <code>height=480</code>、<code>width=832</code>、Wan patch size <code>(1, 2, 2)</code>：
+      </p>
+      <pre><code># video output frames
+num_frames = 81
+
+# latent frames after VAE temporal compression
+latent_frames = (81 - 1) // 4 + 1 = 21
+
+# latent spatial size
+latent_height = 480 // 8 = 60
+latent_width = 832 // 8 = 104
+
+# after Wan patch_embedding, patch_size=(1, 2, 2)
+post_patch_num_frames = 21
+post_patch_height = 60 // 2 = 30
+post_patch_width = 104 // 2 = 52
+
+tokens_per_frame = 30 * 52 = 1560
+sequence_length = 21 * 1560 = 32760
+FramewiseCausalMask.shape = (32760, 32760)</code></pre>
+    </section>
+
+    <script>
+      const frames = 5;
+      const tokensPerFrame = 4;
+      const tokenCount = frames * tokensPerFrame;
+
+      function frameClass(tokenId) {
+        return `f${Math.floor(tokenId / tokensPerFrame)}`;
+      }
+
+      function appendAxisToken(parent, tokenId) {
+        const token = document.createElement("div");
+        token.className = `token-axis ${frameClass(tokenId)}`;
+        token.textContent = tokenId;
+        parent.appendChild(token);
+      }
+
+      function appendCell(parent, className) {
+        const cell = document.createElement("div");
+        cell.className = `attn-cell ${className}`;
+        parent.appendChild(cell);
+      }
+
+      function buildAttentionMap(id, mode) {
+        const root = document.getElementById(id);
+        const corner = document.createElement("div");
+        corner.className = "corner";
+        corner.textContent = "Q/KV";
+        root.appendChild(corner);
+
+        for (let kv = 0; kv < tokenCount; kv += 1) {
+          appendAxisToken(root, kv);
+        }
+
+        for (let q = 0; q < tokenCount; q += 1) {
+          appendAxisToken(root, q);
+          const qFrame = Math.floor(q / tokensPerFrame);
+
+          for (let kv = 0; kv < tokenCount; kv += 1) {
+            const kvFrame = Math.floor(kv / tokensPerFrame);
+            const visible = mode === "full" || qFrame >= kvFrame;
+            appendCell(root, visible ? (mode === "full" ? "full" : "allowed") : "");
+          }
+        }
+      }
+
+      buildAttentionMap("full-map", "full");
+      buildAttentionMap("framewise-map", "framewise");
+    </script>
+  </main>
+</body>
+</html>

@@ -951,6 +951,7 @@ class WanPipeline:
         "do_classifier_free_guidance",
         "guidance_scale",
         "return_residual",
+        "return_self_kv",
         "skip_blocks",
     ),
 )
@@ -968,6 +969,8 @@ def transformer_forward_pass(
     cached_residual=None,
     return_residual=False,
     kv_cache=None,
+    self_kv_cache=None,
+    return_self_kv=False,
     rotary_emb=None,
     encoder_attention_mask=None,
 ):
@@ -981,11 +984,16 @@ def transformer_forward_pass(
       cached_residual=cached_residual,
       return_residual=return_residual,
       kv_cache=kv_cache,
+      self_kv_cache=self_kv_cache,
+      return_self_kv=return_self_kv,
       rotary_emb=rotary_emb,
       encoder_attention_mask=encoder_attention_mask,
   )
 
-  if return_residual:
+  present_self_kv = None
+  if return_self_kv:
+    noise_pred, present_self_kv = outputs
+  elif return_residual:
     noise_pred, residual_x = outputs
   else:
     noise_pred = outputs
@@ -998,6 +1006,8 @@ def transformer_forward_pass(
 
     latents = latents[:bsz]
 
+  if return_self_kv:
+    return noise_pred, latents, present_self_kv
   if return_residual:
     return noise_pred, latents, residual_x
   return noise_pred, latents
@@ -1014,6 +1024,7 @@ def transformer_forward_pass_full_cfg(
     guidance_scale: float,
     encoder_hidden_states_image=None,
     kv_cache=None,
+    self_kv_cache=None,
     rotary_emb=None,
     encoder_attention_mask=None,
 ):
@@ -1035,6 +1046,7 @@ def transformer_forward_pass_full_cfg(
       cached_residual=None,
       return_residual=False,
       kv_cache=kv_cache,
+      self_kv_cache=self_kv_cache,
       rotary_emb=rotary_emb,
       encoder_attention_mask=encoder_attention_mask,
   )

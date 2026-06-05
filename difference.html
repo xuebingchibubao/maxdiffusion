@@ -1,0 +1,773 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Wan2.1 Bidirectional Attention 与 Framewise Causal Attention 差异</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f7f7f5;
+      --panel: #ffffff;
+      --text: #202124;
+      --muted: #5f6368;
+      --border: #d9d9d4;
+      --accent: #0b6b5b;
+      --accent-soft: #dcefeb;
+      --warn: #8a4b08;
+      --warn-soft: #fff0d6;
+      --code-bg: #1f2933;
+      --code-text: #edf2f7;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.55;
+      color: var(--text);
+      background: var(--bg);
+    }
+
+    main {
+      max-width: 1160px;
+      margin: 0 auto;
+      padding: 36px 24px 64px;
+    }
+
+    h1 {
+      margin: 0 0 10px;
+      font-size: 30px;
+      line-height: 1.2;
+      letter-spacing: 0;
+    }
+
+    h2 {
+      margin: 34px 0 12px;
+      font-size: 22px;
+      line-height: 1.25;
+      letter-spacing: 0;
+    }
+
+    h3 {
+      margin: 24px 0 10px;
+      font-size: 17px;
+      line-height: 1.3;
+      letter-spacing: 0;
+    }
+
+    p {
+      margin: 8px 0;
+    }
+
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.95em;
+    }
+
+    .lead {
+      color: var(--muted);
+      max-width: 920px;
+      font-size: 16px;
+    }
+
+    .note {
+      border: 1px solid var(--border);
+      background: var(--panel);
+      border-radius: 8px;
+      padding: 14px 16px;
+      margin: 18px 0;
+    }
+
+    .note strong {
+      color: var(--accent);
+    }
+
+    .warn {
+      border-color: #f0c36d;
+      background: var(--warn-soft);
+      color: var(--warn);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      margin: 16px 0;
+    }
+
+    .card {
+      border: 1px solid var(--border);
+      background: var(--panel);
+      border-radius: 8px;
+      padding: 16px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 16px 0;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    th,
+    td {
+      border-bottom: 1px solid var(--border);
+      padding: 10px 12px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: #ececea;
+      font-weight: 650;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .step {
+      border-left: 4px solid var(--accent);
+      background: var(--panel);
+      border-radius: 8px;
+      padding: 14px 16px;
+      margin: 16px 0;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+    }
+
+    .step-title {
+      display: flex;
+      gap: 10px;
+      align-items: baseline;
+      margin-bottom: 8px;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 30px;
+      height: 24px;
+      padding: 0 8px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-weight: 700;
+      font-size: 13px;
+    }
+
+    .path {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    pre {
+      margin: 12px 0 0;
+      overflow-x: auto;
+      border-radius: 8px;
+      background: var(--code-bg);
+      color: var(--code-text);
+      padding: 14px;
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    pre code {
+      color: inherit;
+      font-size: inherit;
+    }
+
+    .matrix {
+      white-space: pre;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      background: #f0f3f2;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+      overflow-x: auto;
+    }
+
+    ul {
+      margin: 8px 0 8px 22px;
+      padding: 0;
+    }
+
+    li {
+      margin: 6px 0;
+    }
+
+    @media (max-width: 760px) {
+      main {
+        padding: 24px 14px 48px;
+      }
+
+      .grid {
+        grid-template-columns: 1fr;
+      }
+
+      h1 {
+        font-size: 24px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Wan2.1 Bidirectional Attention 与 Framewise Causal Attention 差异</h1>
+    <p class="lead">
+      本文档按运行时函数调用顺序说明：原本 Wan2.1 的 video self-attention 如何保持 bidirectional，
+      以及当前 Causal Forcing framewise AR 配置如何把它改成 framewise causal attention。
+    </p>
+
+    <div class="note warn">
+      <strong>对比口径：</strong>
+      如果和真正的原始 Wan2.1 base 推理相比，这个命令还把 transformer 权重换成了
+      <code>/home/bennett121358/ar_diffusion.pt</code>。本文重点比较 attention 语义；
+      也就是同一套 Wan forward 路径下，<code>framewise_causal_attention=False</code> 的 bidirectional 行为
+      和 <code>framewise_causal_attention=True</code> 的 causal 行为。
+    </div>
+
+    <h2>一句话结论</h2>
+    <div class="grid">
+      <section class="card">
+        <h3>原本 bidirectional self-attention</h3>
+        <p>
+          81 帧 latent token 一次性进入 transformer。self-attention 使用 FullMask：
+          任意 query video token 可以 attend 到任意 video key/value token，包括未来帧。
+        </p>
+      </section>
+      <section class="card">
+        <h3>现在 framewise causal self-attention</h3>
+        <p>
+          81 帧 latent token 仍然一次性进入 transformer，但 self-attention 使用 FramewiseCausalMask：
+          第 <code>t</code> 帧只能看 <code>&lt;= t</code> 的视频帧，同一帧内部空间 token 互相可见。
+        </p>
+      </section>
+    </div>
+
+    <h2>运行命令对应的关键配置</h2>
+    <p>
+      命令入口仍是 Wan2.1 T2V pipeline，但配置覆盖了 transformer 权重和 attention mask 开关。
+    </p>
+    <pre><code>python src/maxdiffusion/generate_wan.py \
+  src/maxdiffusion/configs/causal_forcing_framewise_ar.yml \
+  prompt="A small toy robot walking across a desk" \
+  num_inference_steps=4</code></pre>
+    <pre><code># src/maxdiffusion/configs/causal_forcing_framewise_ar.yml:30-87
+pretrained_model_name_or_path: 'Wan-AI/Wan2.1-T2V-1.3B-Diffusers'
+model_name: wan2.1
+model_type: 'T2V'
+
+wan_transformer_pretrained_model_name_or_path: '/home/bennett121358/ar_diffusion.pt'
+
+attention: 'tokamax_flash'
+flash_min_seq_length: 0
+framewise_causal_attention: True</code></pre>
+
+    <h2>调用链总览</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>顺序</th>
+          <th>函数/模块</th>
+          <th>bidirectional 路径</th>
+          <th>causal 路径</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>1</td>
+          <td><code>generate_wan.py::main</code></td>
+          <td>加载配置并进入 <code>run()</code>。</td>
+          <td>相同。</td>
+        </tr>
+        <tr>
+          <td>2</td>
+          <td><code>pyconfig.wan_init</code></td>
+          <td>普通 Wan transformer path 不设置 causal 开关。</td>
+          <td>本地 <code>.pt</code> path 被允许，并默认设置 <code>framewise_causal_attention=True</code>。</td>
+        </tr>
+        <tr>
+          <td>3</td>
+          <td><code>create_sharded_logical_transformer</code></td>
+          <td><code>wan_config["framewise_causal_attention"] = False</code> 或不存在。</td>
+          <td>把 config 里的 <code>True</code> 传给 <code>WanModel</code>。</td>
+        </tr>
+        <tr>
+          <td>4</td>
+          <td><code>WanPipeline2_1.__call__</code></td>
+          <td>每个 diffusion step 把完整视频 latent 送进 transformer。</td>
+          <td>相同，不是 Python 层逐帧循环生成。</td>
+        </tr>
+        <tr>
+          <td>5</td>
+          <td><code>WanModel.__call__</code></td>
+          <td><code>self_attention_mask = None</code>。</td>
+          <td>patch 后计算每帧 token 数，构造 <code>FramewiseCausalMask</code>。</td>
+        </tr>
+        <tr>
+          <td>6</td>
+          <td><code>WanTransformerBlock.__call__</code></td>
+          <td>self-attention 调用不带 semantic mask。</td>
+          <td>只把 causal mask 传给 <code>attn1</code> self-attention；cross-attention 不变。</td>
+        </tr>
+        <tr>
+          <td>7</td>
+          <td><code>FlaxWanAttention.__call__</code></td>
+          <td>self-attention 的 <code>encoder_attention_mask</code> 仍为空。</td>
+          <td>识别为 self-attention 后，把 <code>self_attention_mask</code> 填入 <code>encoder_attention_mask</code>。</td>
+        </tr>
+        <tr>
+          <td>8</td>
+          <td><code>NNXAttentionOp.apply_attention</code> → <code>_apply_attention</code></td>
+          <td>dispatch 到 Tokamax Splash 时 mask 为 None。</td>
+          <td>dispatch 到 Tokamax Splash 时携带 QxKV semantic mask。</td>
+        </tr>
+        <tr>
+          <td>9</td>
+          <td><code>_tpu_flash_attention</code></td>
+          <td><code>_make_flash_attention_mask(None)</code> 返回 <code>FullMask</code>。</td>
+          <td><code>_make_flash_attention_mask(FramewiseCausalMask)</code> 返回 padding 后 shape 匹配的 causal mask。</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>按函数调用顺序展开</h2>
+
+    <section class="step">
+      <div class="step-title">
+        <span class="badge">1</span>
+        <h3>CLI 入口：初始化配置并加载 pipeline</h3>
+      </div>
+      <p class="path">来源：<code>src/maxdiffusion/generate_wan.py:374-382</code>，<code>src/maxdiffusion/generate_wan.py:130-146</code></p>
+      <p>
+        <code>main()</code> 调用 <code>pyconfig.initialize(argv)</code>，随后进入 <code>run()</code>。
+        对 T2V Wan2.1，<code>call_pipeline()</code> 会把 <code>num_frames</code>、<code>num_inference_steps</code>、
+        prompt、CFG/cache 参数传给 Wan2.1 pipeline。
+      </p>
+      <pre><code>def main(argv: Sequence[str]) -&gt; None:
+  commit_hash = get_git_commit_hash()
+  pyconfig.initialize(argv)
+  max_utils.ensure_machinelearning_job_runs(pyconfig.config)
+  run(pyconfig.config, commit_hash=commit_hash)
+
+...
+
+elif model_type == "T2V":
+  if model_key == WAN2_1:
+    return pipeline(
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        height=config.height,
+        width=config.width,
+        num_frames=config.num_frames,
+        num_inference_steps=config.num_inference_steps,
+        guidance_scale=config.guidance_scale,
+        ...
+    )</code></pre>
+    </section>
+
+    <section class="step">
+      <div class="step-title">
+        <span class="badge">2</span>
+        <h3>pyconfig：允许本地 .pt checkpoint，并打开 causal 开关</h3>
+      </div>
+      <p class="path">来源：<code>src/maxdiffusion/pyconfig.py:157-176</code></p>
+      <p>
+        原本 Wan2.1 只接受已知 transformer model path。现在如果
+        <code>wan_transformer_pretrained_model_name_or_path</code> 是存在的本地 <code>.pt</code> 文件，
+        配置阶段会允许它，并默认设置 <code>framewise_causal_attention=True</code>。
+      </p>
+      <pre><code>elif (
+    transformer_pretrained_model_name_or_path.endswith(".pt")
+    and os.path.isfile(transformer_pretrained_model_name_or_path)
+):
+  raw_keys["framewise_causal_attention"] = raw_keys.get("framewise_causal_attention", True)</code></pre>
+      <p>
+        bidirectional 路径没有这个 semantic mask 开关；或者显式把它设成
+        <code>False</code>，后面就不会构造 framewise causal mask。
+      </p>
+    </section>
+
+    <section class="step">
+      <div class="step-title">
+        <span class="badge">3</span>
+        <h3>pipeline 建模：把 causal 开关传进 WanModel</h3>
+      </div>
+      <p class="path">来源：<code>src/maxdiffusion/pipelines/wan/wan_pipeline.py:143-175</code></p>
+      <p>
+        <code>create_sharded_logical_transformer()</code> 从 Diffusers Wan config 创建 <code>wan_config</code>，
+        再覆盖 MaxDiffusion runtime 参数。新增的关键字段是
+        <code>framewise_causal_attention</code>。
+      </p>
+      <pre><code>def create_model(rngs: nnx.Rngs, wan_config: dict):
+  wan_transformer = WanModel(**wan_config, rngs=rngs)
+  return wan_transformer
+
+...
+
+wan_config["attention"] = config.attention
+wan_config["flash_min_seq_length"] = config.flash_min_seq_length
+wan_config["use_base2_exp"] = config.use_base2_exp
+wan_config["use_experimental_scheduler"] = config.use_experimental_scheduler
+wan_config["framewise_causal_attention"] = getattr(config, "framewise_causal_attention", False)</code></pre>
+    </section>
+
+    <section class="step">
+      <div class="step-title">
+        <span class="badge">4</span>
+        <h3>diffusion loop：每一步仍然输入完整 81 帧 latent</h3>
+      </div>
+      <p class="path">来源：<code>src/maxdiffusion/pipelines/wan/wan_pipeline_2_1.py:370-456</code></p>
+      <p>
+        在每个 denoise step，pipeline 调用 <code>transformer_forward_pass*</code>。
+        对 CFG 情况，代码会复制 batch 维度做 cond/uncond；但帧维度仍是完整视频 latent。
+        因此 causal 不是“外层一帧一帧生成”，而是“同一次 attention 计算里屏蔽未来帧”。
+      </p>
+      <pre><code>for step in range(num_inference_steps):
+  t = jnp.array(scheduler_state.timesteps, dtype=jnp.int32)[step]
+
+  if do_cfg:
+    latents_doubled = jnp.concatenate([latents] * 2)
+    timestep = jnp.broadcast_to(t, bsz * 2)
+    noise_pred, cached_noise_cond, cached_noise_uncond = transformer_forward_pass_full_cfg(
+        graphdef,
+        sharded_state,
+        rest_of_state,
+        latents_doubled,
+        timestep,
+        prompt_embeds_combined,
+        ...
+    )
+  else:
+    noise_pred, latents = transformer_forward_pass(...)</code></pre>
+    </section>
+
+    <section class="step">
+      <div class="step-title">
+        <span class="badge">5</span>
+        <h3>WanModel：patch 后按 frame-major 序列构造 mask</h3>
+      </div>
+      <p class="path">来源：<code>src/maxdiffusion/models/wan/transformers/transformer_wan.py:772-846</code></p>
+      <p>
+        Wan 输入是 <code>[batch, channels, frames, height, width]</code>。
+        经过 transpose、3D patch embedding 和 flatten 后，video token 序列按 frame-major 布局：
+        第 0 帧所有空间 token，然后第 1 帧所有空间 token，依此类推。
+      </p>
+      <pre><code>batch_size, _, num_frames, height, width = hidden_states.shape
+p_t, p_h, p_w = self.config.patch_size
+post_patch_num_frames = num_frames // p_t
+post_patch_height = height // p_h
+post_patch_width = width // p_w
+
+hidden_states = jnp.transpose(hidden_states, (0, 2, 3, 4, 1))
+hidden_states = self.patch_embedding(hidden_states)
+hidden_states = jax.lax.collapse(hidden_states, 1, -1)</code></pre>
+      <p>
+        差异从这里开始：
+      </p>
+      <pre><code>self_attention_mask = None
+if self.framewise_causal_attention:
+  tokens_per_frame = post_patch_height * post_patch_width
+  self_attention_mask = tokamax_splash_attention_mask.FramewiseCausalMask(
+      shape=(hidden_states.shape[1], hidden_states.shape[1]),
+      tokens_per_frame=tokens_per_frame,
+  )</code></pre>
+      <table>
+        <tbody>
+          <tr>
+            <th>bidirectional</th>
+            <td><code>self.framewise_causal_attention=False</code>，所以 <code>self_attention_mask=None</code>。</td>
+          </tr>
+          <tr>
+            <th>causal</th>
+            <td><code>self.framewise_causal_attention=True</code>，所以构造 QxKV 的 <code>FramewiseCausalMask</code>。</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="step">
+      <div class="step-title">
+        <span class="badge">6</span>
+        <h3>WanTransformerBlock：mask 只进入 video self-attention</h3>
+      </div>
+      <p class="path">来源：<code>src/maxdiffusion/models/wan/transformers/transformer_wan.py:859-910</code>，<code>src/maxdiffusion/models/wan/transformers/transformer_wan.py:438-505</code></p>
+      <p>
+        <code>WanModel</code> 把同一个 <code>self_attention_mask</code> 传入每一层 block。
+        block 内部只在 <code>attn1</code> self-attention 调用里传它；后面的 text cross-attention 仍走原来的
+        <code>encoder_attention_mask</code> 逻辑。
+      </p>
+      <pre><code># WanModel.__call__ scan/non-scan block call
+hidden_states = block(
+    hidden_states_carry,
+    encoder_hidden_states,
+    timestep_proj,
+    rotary_emb,
+    deterministic,
+    rngs_carry,
+    encoder_attention_mask,
+    self_attention_mask,
+    cached_kv=layer_kv_cache,
+)
+
+# WanTransformerBlock.__call__
+attn_output = self.attn1(
+    hidden_states=norm_hidden_states,
+    encoder_hidden_states=norm_hidden_states,
+    rotary_emb=rotary_emb,
+    self_attention_mask=self_attention_mask,
+    deterministic=deterministic,
+    rngs=rngs,
+)</code></pre>
+      <p>
+        注意这里 self-attention 显式传了
+        <code>encoder_hidden_states=norm_hidden_states</code>，所以不能再靠
+        <code>encoder_hidden_states is None</code> 判断 self/cross attention。
+      </p>
+    </section>
+
+    <section class="step">
+      <div class="step-title">
+        <span class="badge">7</span>
+        <h3>FlaxWanAttention：用初始化时的 self-attention 标记接管 mask</h3>
+      </div>
+      <p class="path">来源：<code>src/maxdiffusion/models/attention_flax.py:1450-1458</code>，<code>src/maxdiffusion/models/attention_flax.py:1645-1671</code></p>
+      <p>
+        初始化 attention 层时记录 <code>self.is_self_attention</code>。调用时，如果这是 self-attention 且上游传入
+        <code>self_attention_mask</code>，就把它作为本次 attention op 的 <code>encoder_attention_mask</code>。
+      </p>
+      <pre><code>if is_self_attention:
+  axis_names_q = (BATCH, SELF_ATTN_HEAD, SELF_ATTN_Q_LENGTH, D_KV)
+  axis_names_kv = (BATCH, SELF_ATTN_HEAD, SELF_ATTN_KV_LENGTH, D_KV)
+else:
+  axis_names_q = (BATCH, CROSS_ATTN_HEAD, CROSS_ATTN_Q_LENGTH, D_KV)
+  axis_names_kv = (BATCH, CROSS_ATTN_HEAD, CROSS_ATTN_KV_LENGTH, D_KV)
+
+self.is_self_attention = is_self_attention</code></pre>
+      <pre><code>is_self_attention = self.is_self_attention
+if encoder_hidden_states is None:
+  encoder_hidden_states = hidden_states
+
+is_i2v_cross_attention = self.added_kv_proj_dim is not None and not is_self_attention
+
+if not is_i2v_cross_attention and not is_self_attention:
+  encoder_attention_mask = None
+if is_self_attention and self_attention_mask is not None:
+  encoder_attention_mask = self_attention_mask</code></pre>
+      <p>
+        这里保留了 cross-attention 的原有行为：T2V cross-attention 默认不传 mask，I2V image padding mask 仍可用。
+      </p>
+    </section>
+
+    <section class="step">
+      <div class="step-title">
+        <span class="badge">8</span>
+        <h3>AttentionOp：projection 完成后把 mask 交给 kernel dispatcher</h3>
+      </div>
+      <p class="path">来源：<code>src/maxdiffusion/models/attention_flax.py:1681-1711</code>，<code>src/maxdiffusion/models/attention_flax.py:1307-1329</code>，<code>src/maxdiffusion/models/attention_flax.py:1040-1065</code></p>
+      <p>
+        Q/K/V projection、RoPE 之后，attention 层统一调用 <code>NNXAttentionOp.apply_attention()</code>。
+        这个函数再把 <code>attention_mask</code> 放进 context，按配置选择 <code>dot_product</code>、
+        <code>flash</code> 或 <code>tokamax_flash</code>。
+      </p>
+      <pre><code>attn_output = self.attention_op.apply_attention(
+    query_proj,
+    key_proj,
+    value_proj,
+    attention_mask=encoder_attention_mask,
+)
+
+...
+
+context = {
+    "attention_mask": attention_mask,
+    "heads": heads,
+    "mesh": mesh,
+    "flash_block_sizes": flash_block_sizes,
+    ...
+}
+
+if attention_kernel in KERNEL_REGISTRY:
+  return KERNEL_REGISTRY[attention_kernel](query, key, value, context)</code></pre>
+      <p>
+        当前配置是 <code>attention: 'tokamax_flash'</code> 和 <code>flash_min_seq_length: 0</code>，
+        所以会进入 Tokamax Splash attention 路径。
+      </p>
+    </section>
+
+    <section class="step">
+      <div class="step-title">
+        <span class="badge">9</span>
+        <h3>Splash/Tokamax：FullMask 与 FramewiseCausalMask 的真正分岔</h3>
+      </div>
+      <p class="path">来源：<code>src/maxdiffusion/models/attention_flax.py:234-286</code>，<code>src/maxdiffusion/models/attention_flax.py:420-462</code></p>
+      <p>
+        <code>_is_semantic_attention_mask()</code> 用来区分两类 mask：
+        batch padding mask 是 <code>[batch, kv_len]</code>，仍用于 segment ids；
+        semantic QxKV mask 是 <code>[q_len, kv_len]</code>，用于真正控制 attention 可见性。
+      </p>
+      <pre><code>def _is_semantic_attention_mask(attention_mask) -&gt; bool:
+  if attention_mask is None:
+    return False
+  if isinstance(attention_mask, jax.Array):
+    return False
+  if isinstance(attention_mask, np.ndarray):
+    return attention_mask.dtype == np.bool_ and attention_mask.ndim == 2
+  return hasattr(attention_mask, "shape") and len(attention_mask.shape) == 2</code></pre>
+      <p>
+        进入 Splash kernel 前，bidirectional 和 causal 的分岔如下：
+      </p>
+      <pre><code>def _make_flash_attention_mask(attention_mask, shape: tuple[int, int], attention_kernel: str):
+  if attention_mask is None:
+    if attention_kernel in ["tokamax_flash", "tokamax_ring"]:
+      return tokamax_splash_attention_mask.FullMask(_shape=shape)
+    return splash_attention_mask.FullMask(_shape=shape)
+
+  if isinstance(attention_mask, tokamax_splash_attention_mask.FramewiseCausalMask):
+    if attention_kernel in ["tokamax_flash", "tokamax_ring"]:
+      return tokamax_splash_attention_mask.FramewiseCausalMask(
+          shape=shape,
+          tokens_per_frame=attention_mask.tokens_per_frame,
+      )
+    dense_mask = attention_mask[(slice(0, shape[0]), slice(0, shape[1]))]
+    return splash_attention_mask.NumpyMask(_pad_dense_mask_to_shape(dense_mask, shape))</code></pre>
+      <pre><code>semantic_attention_mask = attention_mask if _is_semantic_attention_mask(attention_mask) else None
+mask = _make_flash_attention_mask(
+    semantic_attention_mask,
+    (query.shape[2], key.shape[2]),
+    attention_kernel,
+)
+
+if attention_kernel == "tokamax_flash":
+  splash_kernel = tokamax_splash_attention_kernel.make_splash_mha(
+      mask=mask,
+      q_seq_shards=1,
+      config=convert_to_tokamax_splash_config(...),
+      save_residuals=False,
+  )</code></pre>
+      <table>
+        <tbody>
+          <tr>
+            <th>bidirectional</th>
+            <td><code>attention_mask is None</code>，返回 <code>FullMask</code>，所有 QxKV video token 可见。</td>
+          </tr>
+          <tr>
+            <th>causal</th>
+            <td>
+              <code>attention_mask</code> 是 <code>FramewiseCausalMask</code>。
+              Tokamax 会 pad sequence length，所以这里按 padded <code>shape</code> 重建 mask，避免 mask shape 和 kernel 输入不一致。
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="step">
+      <div class="step-title">
+        <span class="badge">10</span>
+        <h3>FramewiseCausalMask：按帧，而不是按 token 下三角</h3>
+      </div>
+      <p class="path">来源：<code>src/maxdiffusion/kernels/splash_attention/splash_attention_mask.py:349-378</code></p>
+      <p>
+        这个 mask 的核心规则是把 token id 除以 <code>tokens_per_frame</code> 得到 frame id。
+        query frame 必须大于等于 key/value frame。这样同一帧内部所有空间 token 互相可见，只有未来帧被屏蔽。
+      </p>
+      <pre><code>class FramewiseCausalMask(_ComputableMask):
+  """Lazy framewise causal mask.
+
+  Tokens are laid out frame-major. A token from frame t may attend to all
+  spatial tokens in frames &lt;= t, including the whole current frame, but not to
+  tokens from future frames.
+  """
+
+  def __init__(self, shape: tuple[int, int], tokens_per_frame: int, shard_count: int = 1):
+    if tokens_per_frame &lt;= 0:
+      raise ValueError("tokens_per_frame must be positive")
+    self.tokens_per_frame = tokens_per_frame
+
+    def framewise_causal_mask_function(q_ids, kv_ids):
+      q_frame = q_ids // self.tokens_per_frame
+      kv_frame = kv_ids // self.tokens_per_frame
+      return q_frame &gt;= kv_frame</code></pre>
+      <p>假设 3 帧、每帧 2 个 token，mask 语义如下：</p>
+      <div class="matrix">bidirectional FullMask:
+[[1, 1, 1, 1, 1, 1],
+ [1, 1, 1, 1, 1, 1],
+ [1, 1, 1, 1, 1, 1],
+ [1, 1, 1, 1, 1, 1],
+ [1, 1, 1, 1, 1, 1],
+ [1, 1, 1, 1, 1, 1]]
+
+framewise causal:
+[[1, 1, 0, 0, 0, 0],
+ [1, 1, 0, 0, 0, 0],
+ [1, 1, 1, 1, 0, 0],
+ [1, 1, 1, 1, 0, 0],
+ [1, 1, 1, 1, 1, 1],
+ [1, 1, 1, 1, 1, 1]]</div>
+    </section>
+
+    <h2>最终差异总结</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>维度</th>
+          <th>原本 bidirectional Wan self-attention</th>
+          <th>现在 framewise causal attention</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>视频生成方式</td>
+          <td>每个 denoise step 处理完整视频 latent。</td>
+          <td>仍然每个 denoise step 处理完整视频 latent。</td>
+        </tr>
+        <tr>
+          <td>mask 对象</td>
+          <td><code>FullMask</code> 或无 semantic mask。</td>
+          <td><code>FramewiseCausalMask</code>。</td>
+        </tr>
+        <tr>
+          <td>query frame t 能看到</td>
+          <td>所有 video frames：过去、当前、未来。</td>
+          <td>text/context tokens 以及 video frames <code>&lt;= t</code>。</td>
+        </tr>
+        <tr>
+          <td>同一帧内部空间 token</td>
+          <td>互相可见。</td>
+          <td>仍然互相可见。</td>
+        </tr>
+        <tr>
+          <td>未来帧 token</td>
+          <td>可见。</td>
+          <td>不可见。</td>
+        </tr>
+        <tr>
+          <td>cross-attention</td>
+          <td>正常 attend text/context。</td>
+          <td>不改，仍正常 attend text/context。</td>
+        </tr>
+        <tr>
+          <td>kernel 接入</td>
+          <td>Tokamax Splash 接收 <code>FullMask</code>。</td>
+          <td>Tokamax Splash 接收按 padded shape 重建的 <code>FramewiseCausalMask</code>。</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="note">
+      <strong>关键判断：</strong>
+      对这个命令来说，81 帧不是外层逐帧生成；它们仍然同时组成 transformer 的 latent sequence。
+      “causal”的实现点是 self-attention 的 QxKV 可见性 mask，而不是 diffusion loop 的结构变化。
+    </div>
+  </main>
+</body>
+</html>

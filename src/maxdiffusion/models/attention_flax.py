@@ -286,6 +286,23 @@ def _make_flash_attention_mask(attention_mask, shape: tuple[int, int], attention
   return splash_attention_mask.NumpyMask(_pad_dense_mask_to_shape(dense_mask, shape))
 
 
+def _round_up_to_multiple(value: int, multiple: int) -> int:
+  return ((value + multiple - 1) // multiple) * multiple
+
+
+def _round_down_to_multiple(value: int, multiple: int) -> int:
+  return (value // multiple) * multiple
+
+
+def _largest_aligned_divisor_at_most(value: int, limit: int, multiple: int) -> int:
+  candidate = min(value, _round_down_to_multiple(limit, multiple))
+  while candidate >= multiple:
+    if value % candidate == 0:
+      return candidate
+    candidate -= multiple
+  return value
+
+
 def _select_flash_block_sizes(
     query: Array,
     key: Array,
@@ -298,7 +315,7 @@ def _select_flash_block_sizes(
 
   q_max_block_size = 1024 if dtype == jnp.bfloat16 else 512
   if key_seq_len != query_seq_len:
-    kv_max_block_size = ((key_seq_len + 127) // 128) * 128
+    kv_max_block_size = _round_up_to_multiple(key_seq_len, 128)
   else:
     kv_max_block_size = q_max_block_size
 
@@ -311,16 +328,47 @@ def _select_flash_block_sizes(
 
   block_size_q = flash_block_sizes.block_q if flash_block_sizes else q_max_block_size
   use_tokamax = attention_kernel in ["tokamax_flash", "tokamax_ring"]
+  if not use_tokamax:
+    return splash_attention_kernel.BlockSizes(
+        block_q=block_size_q,
+        block_kv_compute=min(kv_max_block_size, key_seq_len),
+        block_kv=min(kv_max_block_size, key_seq_len),
+        block_q_dkv=block_size_q,
+        block_kv_dkv=min(kv_max_block_size, key_seq_len),
+        block_kv_dkv_compute=min(kv_max_block_size, query_seq_len),
+        block_q_dq=block_size_q,
+        block_kv_dq=min(kv_max_block_size, query_seq_len),
+        use_fused_bwd_kernel=False,
+    )
+
+  block_size_q = _round_up_to_multiple(block_size_q, 128)
+  configured_kv_block_size = getattr(flash_block_sizes, "block_kv", q_max_block_size) if flash_block_sizes else q_max_block_size
+  configured_kv_compute_size = (
+      getattr(flash_block_sizes, "block_kv_compute", configured_kv_block_size)
+      if flash_block_sizes
+      else configured_kv_block_size
+  )
+  block_kv_size = min(_round_up_to_multiple(configured_kv_block_size, 128), kv_max_block_size)
+  block_kv_compute_size = _largest_aligned_divisor_at_most(
+      block_kv_size,
+      min(_round_up_to_multiple(configured_kv_compute_size, 128), block_kv_size),
+      128,
+  )
+  block_kv_dkv_compute = _largest_aligned_divisor_at_most(
+      block_kv_size,
+      min(_round_up_to_multiple(query_seq_len, 128), block_kv_compute_size),
+      128,
+  )
   return splash_attention_kernel.BlockSizes(
       block_q=block_size_q,
-      block_kv_compute=min(kv_max_block_size, key_seq_len),
-      block_kv=min(kv_max_block_size, key_seq_len),
+      block_kv_compute=block_kv_compute_size,
+      block_kv=block_kv_size,
       block_q_dkv=block_size_q,
-      block_kv_dkv=min(kv_max_block_size, key_seq_len),
-      block_kv_dkv_compute=min(kv_max_block_size, query_seq_len),
-      block_q_dq=None if use_tokamax else block_size_q,
-      block_kv_dq=None if use_tokamax else min(kv_max_block_size, query_seq_len),
-      use_fused_bwd_kernel=True if use_tokamax else False,
+      block_kv_dkv=block_kv_size,
+      block_kv_dkv_compute=block_kv_dkv_compute,
+      block_q_dq=None,
+      block_kv_dq=None,
+      use_fused_bwd_kernel=True,
   )
 
 
@@ -1652,6 +1700,7 @@ class FlaxWanAttention(nnx.Module):
       deterministic: bool = True,
       rngs: nnx.Rngs = None,
       cached_kv: Optional[Dict[str, Tuple[jax.Array, jax.Array]]] = None,
+      return_kv: bool = False,
   ) -> jax.Array:
     axis_names = nn.logical_to_mesh_axes((BATCH, LENGTH, HEAD))
     hidden_states = jax.lax.with_sharding_constraint(hidden_states, axis_names)
@@ -1697,6 +1746,15 @@ class FlaxWanAttention(nnx.Module):
           value_proj = _unflatten_heads(value_proj, self.heads)
           # output of _unflatten_heads Batch, heads, seq_len, head_dim
           query_proj, key_proj = self._apply_rope(query_proj, key_proj, rotary_emb)
+
+      present_kv = None
+      if is_self_attention and (return_kv or (cached_kv is not None and "self" in cached_kv)):
+        present_kv = (key_proj, value_proj)
+        if cached_kv is not None and "self" in cached_kv:
+          cached_key, cached_value = cached_kv["self"]
+          key_proj = jnp.concatenate([cached_key, key_proj], axis=2)
+          value_proj = jnp.concatenate([cached_value, value_proj], axis=2)
+          encoder_attention_mask = None
 
       query_proj = checkpoint_name(query_proj, "query_proj")
       key_proj = checkpoint_name(key_proj, "key_proj")
@@ -1808,6 +1866,8 @@ class FlaxWanAttention(nnx.Module):
       hidden_states = self.proj_attn(attn_output)
       if self.drop_out.rate > 0:
         hidden_states = self.drop_out(hidden_states, deterministic=deterministic, rngs=rngs)
+    if return_kv:
+      return hidden_states, {"self": present_kv}
     return hidden_states
 
   def compute_kv(
